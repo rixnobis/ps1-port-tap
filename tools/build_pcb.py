@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build ps1-port-tap.kicad_pcb from the schematic netlist.
 
-  build_pcb.py place   - footprints, outline, silk, nets; writes the board + DSN
-  build_pcb.py finish  - imports the Freerouting session, pours GND, stitches, saves
+  build_pcb.py place   - footprints, outline, silk, nets and the hand route
+  build_pcb.py finish  - pours GND on both layers, stitches, saves
 
 Coordinates are millimetres from the board's top-left corner.
 """
@@ -19,8 +19,6 @@ NAME = "ps1-port-tap"
 PCB = ROOT / f"{NAME}.kicad_pcb"
 PRO = ROOT / f"{NAME}.kicad_pro"
 SCH = ROOT / f"{NAME}.kicad_sch"
-DSN = ROOT / "build" / f"{NAME}.dsn"
-SES = ROOT / "build" / f"{NAME}.ses"
 FPDIR = Path("/usr/share/kicad/footprints")
 
 OX, OY = 100.0, 100.0          # sheet offset of the board origin
@@ -28,7 +26,9 @@ W, H = 40.0, 51.0              # board size
 PITCH = 2.54
 LINE_Y0 = 9.0                  # J1/J2 pin 1
 J1_X, J2_X = 9.0, 31.0
-J3_X0, J3_Y = W / 2 - 4 * PITCH, 43.5   # J3 leftmost column; even row is PITCH below
+# J3 sits 0.6 mm left of centre so the DAT tap via (rightmost column, on line 1)
+# clears J2 pad 1; even row is PITCH below
+J3_X0, J3_Y = W / 2 - 4 * PITCH - 0.6, 43.5
 R_Y = 38.4                     # resistor centres
 
 SHORT = {"/DAT": "DAT", "/CMD": "CMD", "/+7V5": "7V5", "/+3V5": "3V5", "/~{CS}": "CS",
@@ -243,13 +243,97 @@ def place():
             ol.Append(mm(OX + x + dx), mm(OY + R_Y + dy))
         board.Add(k)
 
+    # No pour inside a pad row: between two pads the fill can only form pointed
+    # cusps, so it stops at a straight edge along the row instead. GND pads inside
+    # a strip reach the pour through explicit traces (see route()).
+    CL = 0.85 + 0.3
+    strips = [(J1_X - CL, LINE_Y0 - CL, J1_X + CL, LINE_Y0 + 9 * PITCH + CL),
+              (J2_X - CL, LINE_Y0 - CL, J2_X + CL, LINE_Y0 + 9 * PITCH + CL),
+              (col_x(8) - CL, J3_Y - CL, col_x(0) + CL, J3_Y + PITCH + CL),
+              (col_x(7) - 0.8, R_Y - 1.55, col_x(0) + 0.8, R_Y + 1.55, "F")]  # SMD: top only
+    for x0, y0, x1, y1, *side in strips:
+        k = pcbnew.ZONE(board)
+        k.SetIsRuleArea(True)
+        k.SetDoNotAllowZoneFills(True)
+        k.SetDoNotAllowTracks(False)
+        k.SetDoNotAllowVias(False)
+        k.SetDoNotAllowPads(False)
+        k.SetDoNotAllowFootprints(False)
+        lset = pcbnew.LSET()
+        lset.AddLayer(pcbnew.F_Cu)
+        if not side:
+            lset.AddLayer(pcbnew.B_Cu)
+        k.SetLayerSet(lset)
+        ol = k.Outline()
+        ol.NewOutline()
+        for x, y in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]:
+            ol.Append(mm(OX + x), mm(OY + y))
+        board.Add(k)
+
+    route(board, nets, pads)
     pcbnew.SaveBoard(str(PCB), board)
-    DSN.parent.mkdir(exist_ok=True)
-    board = pcbnew.LoadBoard(str(PCB))
-    # GND is carried by pours on both layers; keep the autorouter off it
-    ok = pcbnew.ExportSpecctraDSN(board, str(DSN))
-    assert ok, "DSN export failed"
-    print("placed; wrote", PCB, DSN)
+    print("placed and routed;", PCB)
+
+
+# Port pins tapped, in J3 column order (column 0 = DAT, the rightmost)
+TAP_PINS = [1, 2, 3, 5, 6, 7, 8, 9]
+POWER_W, SIGNAL_W = 0.6, 0.3
+
+
+def track(board, net, layer, a, b, w):
+    t = pcbnew.PCB_TRACK(board)
+    t.SetStart(pt(*a))
+    t.SetEnd(pt(*b))
+    t.SetLayer(layer)
+    t.SetWidth(mm(w))
+    t.SetNet(net)
+    board.Add(t)
+
+
+def route(board, nets, pads):
+    """Every run is straight. Port line n crosses B.Cu from J1 pin n to J2 pin n;
+    a tapped line drops through a via at its J3 column and runs straight down F.Cu
+    to its resistor, and the resistor runs straight down to its J3 pin."""
+    tapped = {pin: i for i, pin in enumerate(TAP_PINS)}
+    for n in range(1, 11):
+        net_name = pads[("J1", str(n))]
+        net = nets[net_name]
+        y = LINE_Y0 + PITCH * (n - 1)
+        w = POWER_W if net_name in POWER_NETS else SIGNAL_W
+        if n not in tapped:
+            track(board, net, pcbnew.B_Cu, (J1_X, y), (J2_X, y), w)
+            continue
+        x = col_x(tapped[n])
+        track(board, net, pcbnew.B_Cu, (J1_X, y), (x, y), w)
+        track(board, net, pcbnew.B_Cu, (x, y), (J2_X, y), w)
+        v = pcbnew.PCB_VIA(board)
+        v.SetPosition(pt(x, y))
+        big = net_name in POWER_NETS
+        v.SetWidth(mm(0.8 if big else 0.6))
+        v.SetDrill(mm(0.4 if big else 0.3))
+        v.SetNet(net)
+        board.Add(v)
+        r = f"R{tapped[n] + 1}"
+        fp = board.FindFootprintByReference(r)
+        p1 = [q for q in fp.Pads() if q.GetNumber() == "1"][0].GetPosition()
+        p2 = [q for q in fp.Pads() if q.GetNumber() == "2"][0].GetPosition()
+        r_y1, r_y2 = pcbnew.ToMM(p1.y) - OY, pcbnew.ToMM(p2.y) - OY
+        assert abs(pcbnew.ToMM(p1.x) - OX - x) < 0.001, (r, "not under its via")
+        track(board, net, pcbnew.F_Cu, (x, y), (x, r_y1), w)
+        tap = nets[pads[(r, "2")]]
+        track(board, tap, pcbnew.F_Cu, (x, r_y2), (x, J3_Y), SIGNAL_W)
+
+    # GND out of the no-pour strips: the J3 even row is bussed on both layers and
+    # the bus runs past both ends of the row into the pour; the port GND pads get a
+    # straight F.Cu stub into the pour (B.Cu already has the through-line).
+    gnd = nets["/GND"]
+    gy = J3_Y + PITCH
+    for layer in (pcbnew.F_Cu, pcbnew.B_Cu):
+        track(board, gnd, layer, (col_x(8) - 2.2, gy), (col_x(0) + 2.2, gy), POWER_W)
+        track(board, gnd, layer, (col_x(8), J3_Y), (col_x(8), gy), POWER_W)  # pad 17
+    y4 = LINE_Y0 + 3 * PITCH
+    track(board, gnd, pcbnew.F_Cu, (J1_X, y4), (J1_X - 2.5, y4), POWER_W)   # outward,
+    track(board, gnd, pcbnew.F_Cu, (J2_X, y4), (J2_X + 2.5, y4), POWER_W)   # clear of taps
 
 
 def seg_dist(p, a, b):
@@ -276,9 +360,6 @@ def via_clear(board, x, y, r, clearance):
 
 def finish():
     board = pcbnew.LoadBoard(str(PCB))
-    assert SES.exists(), SES
-    ok = pcbnew.ImportSpecctraSES(board, str(SES))
-    assert ok, "SES import failed"
     gnd = board.FindNet("/GND")
     assert gnd is not None
     for layer in (pcbnew.F_Cu, pcbnew.B_Cu):
@@ -286,7 +367,10 @@ def finish():
         z.SetLayer(layer)
         z.SetNet(gnd)
         z.SetLocalClearance(mm(0.3))
-        z.SetMinThickness(mm(0.25))
+        # 0.4 mm minimum width: no pour sliver can squeeze between two header pads
+        # (0.84 mm gap less 2 x 0.3 mm clearance), and isolated islands are dropped
+        z.SetMinThickness(mm(0.4))
+        z.SetIslandRemovalMode(pcbnew.ISLAND_REMOVAL_MODE_ALWAYS)
         z.SetPadConnection(pcbnew.ZONE_CONNECTION_THERMAL)
         z.SetThermalReliefGap(mm(0.3))
         z.SetThermalReliefSpokeWidth(mm(0.5))
@@ -299,7 +383,8 @@ def finish():
     # Stitching: GND vias between the B.Cu through-lines turn the strips there into
     # guard ground tied to the F.Cu pour; the rest tie the two pours together.
     # A candidate is kept only if it clears every pad, hole and track.
-    cands = [(x, LINE_Y0 + PITCH * (k + 0.5)) for k in range(9) for x in (13.5, 17.5, 21.5)]
+    mids = [J3_X0 + PITCH * (k + 0.5) for k in range(1, 8)]  # between tap columns
+    cands = [(x, LINE_Y0 + PITCH * (k + 0.5)) for k in range(9) for x in mids]
     cands += [(x, 35.0) for x in (5.0, W - 5.0)] + [(x, 41.5) for x in (5.0, W - 5.0)]
     cands += [(x, 5.5) for x in (9.0, 15.0, 25.0, 31.0)]
     kept = 0

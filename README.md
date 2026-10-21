@@ -42,13 +42,18 @@ cannot short it.
 
 ## Layout
 
-Two layers, 40 x 51 mm. The through-lines run straight across B.Cu, and the taps fan
-down to the resistors on F.Cu. Both layers are poured with GND. A row of stitching vias
-sits in each gap between through-lines, so the copper there stays as stitched guard
-ground (the pour would otherwise drop it as islands). The port GND pads connect solid
-to both pours, with no thermal relief. Routing is done by Freerouting, so
-small details like which side a tap leaves from change between runs; every committed
-board has passed DRC with schematic parity.
+Two layers, 40 x 51 mm, routed by script and every run straight. Port line n crosses
+B.Cu from J1 pin n to J2 pin n. A tapped line drops through a via at its J3 column and
+runs straight down F.Cu to its resistor, and on to its J3 pin. Both layers are poured
+with GND, with stitching vias between the through-lines, so the copper there stays as
+stitched guard ground. The pour stops at a straight edge around each pad row, because
+between two header pads it can only form slivers; the GND pins inside those strips reach
+the pour through traces.
+
+`tools/check_geometry.py` checks what DRC does not. It flags any bend sharper than
+45 degrees, any segment shorter than its width, any trace narrower than its net class,
+any dangling end and any overlapping segment. `tools/crops.sh` renders every pad row
+and the resistor row at about 4x, in `renders/crops/`.
 
 ## Files
 
@@ -62,9 +67,9 @@ board has passed DRC with schematic parity.
 ## Rebuilding
 
 Everything is generated from the scripts in `tools/`. `tools/build.sh` runs the whole
-pipeline: schematic, ERC, placement through the pcbnew Python API, Freerouting, pours,
-DRC with schematic parity, renders and fab outputs. It stops on any ERC or DRC
-violation. Requires KiCad 10 (`kicad-cli` and the `pcbnew` Python module) and the
-Freerouting jar (set `FREEROUTING` to its path).
+pipeline: schematic, ERC, placement and routing through the pcbnew Python API, pours,
+DRC with schematic parity, the geometry check, renders, crops and fab outputs. It stops
+on any ERC, DRC or geometry finding. Requires KiCad 10 (`kicad-cli` and the `pcbnew`
+Python module), `rsvg-convert` and ImageMagick.
 
 Not yet built or tested on hardware.
